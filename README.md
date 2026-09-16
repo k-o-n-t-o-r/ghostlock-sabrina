@@ -61,8 +61,9 @@ This exploit was **ported and developed by [Claude Opus 4.6](https://www.anthrop
 
 ## References
 
-- **[GhostLock (original exploit)](https://github.com/AnomalyStudio/ghostlock)** -- the OnePlus/Pixel GhostLock exploit by AnomalyStudio that this port is based on
-- **[KernelSnitch](https://github.com/IAIK/KernelSnitch)** -- timing side-channel for leaking kernel heap addresses via futex hash collisions (Gruss et al., TU Graz)
+- **[CyberMeowfia / IonStack](https://github.com/NebuSec/CyberMeowfia)** -- the original GhostLock exploit by NebuSec that this port is based on
+- **[ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)** -- OnePlus/Pixel adaptation of GhostLock
+- **[KernelSnitch](https://github.com/isec-tugraz/KernelSnitch)** -- timing side-channel for leaking kernel heap addresses via futex hash collisions (Gruss et al., TU Graz)
 - **[CVE-2026-43499](https://nvd.nist.gov/vuln/detail/CVE-2026-43499)** -- the futex PI use-after-free vulnerability
 - **Linux kernel 5.15 source** -- `kernel/futex/`, `kernel/locking/rtmutex.c`, `lib/rbtree.c`
 
